@@ -29,6 +29,7 @@ import tornado.web
 import tornado.websocket
 from functools import partial
 from nanoid import generate as nanoid
+from litellm import completion
 
 
 class RealtimeHandler(tornado.websocket.WebSocketHandler):
@@ -225,10 +226,16 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
         })
 
     async def llm(self):
-        # TODO
-        for delta in ['Hello! ', 'How ', 'can I ', 'assist ', 'you ', 'today?']:
-            await asyncio.sleep(0.1)
-            yield delta
+        model = self.session.get('model')
+        if model == 'gpt-4o-realtime-preview-2024-10-01':
+            model = 'gpt-4o-mini'  # TODO
+        messages = [{
+            'role': item['role'],
+            'content': item['content'][0].get('text') or item['content'][0].get('input_text'),
+        } for item in self.conversation if len(item['content']) > 0]
+        response = completion(model=model, messages=messages, stream=True)
+        for part in response:
+            yield part.choices[0].delta.content or ""
 
     def server_event(self, event_type, **kwargs):
         data = dict(
