@@ -7,6 +7,7 @@ realtime api
 4. input_audio_buffer.speech_started
 4. input_audio_buffer.speech_stopped
 4. input_audio_buffer.committed
+4. conversation.item.input_audio_transcription.completed  //
 4. conversation.item.created(user)
 5. response.created
 6. response.output_item.added
@@ -20,7 +21,11 @@ realtime api
 7. response.output_item.done
 6. response.done
 """
+import os
+import base64
 import json
+import numpy
+import fsmnvad
 import asyncio
 import logging
 import tornado.log
@@ -30,6 +35,10 @@ import tornado.websocket
 from functools import partial
 from nanoid import generate as nanoid
 from litellm import completion
+from pathlib import Path
+
+
+root_dir = Path(os.path.dirname(os.path.abspath(__file__)))
 
 
 class RealtimeHandler(tornado.websocket.WebSocketHandler):
@@ -45,12 +54,12 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
             voice='alloy',
             input_audio_format='pcm16',
             output_audio_format='pcm16',
-            input_audio_transcription=None,
+            input_audio_transcription={'model': 'whisper-1'},
             turn_detection=dict(
                 type='server_vad',
                 threshold=0.5,
                 prefix_padding_ms=300,
-                silence_duration_ms=200
+                silence_duration_ms=500,
             ),
             tools=[],
             tool_choice='auto',
@@ -59,6 +68,18 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
         )
         self.conversation = list()
         self.response_task = None
+        self.transcript_task = None
+        self.input_audio_buffer = numpy.array([])
+        self.new_user_message_id = None
+        self.audio_end_ms = 0
+        self.segments_result = [[-1, 0]]
+        self.segments_cache = []
+        self.vad_online = fsmnvad.FSMNVadOnline(root_dir / 'config.yaml')
+        # OpenAI realtime API sample_rate=24000, but fsmnvad using sample_rate=16000
+        # frontend = self.vad_online.frontend
+        # frontend.opts.frame_opts.samp_freq = 24000
+        # frontend.frame_sample_length = int(frontend.opts.frame_opts.frame_length_ms * frontend.opts.frame_opts.samp_freq / 1000)
+        # frontend.frame_shift_sample_length = int(frontend.opts.frame_opts.frame_shift_ms * frontend.opts.frame_opts.samp_freq / 1000)
         
     def check_origin(self, origin):
         return True
@@ -72,7 +93,7 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
         self.server_event('session.created', session=self.session)
 
     def on_message(self, message):
-        logging.info("on_message %r", message)
+        logging.info("on_message %r", message[:100])
         try:
             event = json.loads(message)
             self.client_event(**event)
@@ -89,11 +110,85 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
         elif type == 'session.update':
             # TODO
             self.server_event('session.updated', session=self.session)
+        elif type == 'input_audio_buffer.append':
+            self.append_audio_buffer(**kwargs)
+
+    def append_audio_buffer(self, audio='', **kwargs):
+        audio_data = numpy.frombuffer(
+            base64.b64decode(audio.encode()),
+            numpy.int16
+        ).flatten().astype(numpy.float32) / (1 << 15)
+        self.input_audio_buffer = numpy.append(self.input_audio_buffer, audio_data)
+        segments_result, self.segments_cache = self.vad_online.segments_online(
+            audio_data,
+            in_cache=self.segments_cache,
+            is_final=False,
+        )
+        if segments_result:
+            audio_start_ms = segments_result[-1][0]
+            if audio_start_ms != self.segments_result[-1][0]:
+                self.new_user_message_id = nanoid()
+                self.server_event('input_audio_buffer.speech_started', audio_start_ms=audio_start_ms, item_id=self.new_user_message_id)
+            self.segments_result = segments_result
+        else:
+            audio_end_ms = self.segments_result[-1][1]
+            if audio_end_ms and audio_end_ms != self.audio_end_ms:
+                self.audio_end_ms = audio_end_ms
+                silence_duration_ms = self.session.get('turn_detection', {}).get('silence_duration_ms', 500)
+                sample_rate = self.vad_online.frontend.opts.frame_opts.samp_freq
+                duration = len(self.input_audio_buffer) / sample_rate * 1000
+                if duration - silence_duration_ms > audio_end_ms:
+                    item_id = self.new_user_message_id
+                    self.server_event(
+                        'input_audio_buffer.speech_stopped',
+                        audio_end_ms=audio_end_ms,
+                        item_id=item_id,
+                    )
+                    previous_item_id = self.conversation[-1].get('id') if len(self.conversation) > 0 else None
+                    self.server_event(
+                        'input_audio_buffer.committed',
+                        audio_end_ms=audio_end_ms,
+                        item_id=item_id,
+                        previous_item_id=previous_item_id,
+                    )
+                    self.cancel_task()
+                    self.transcript_task = asyncio.create_task(self.create_transcript(item_id, previous_item_id))
+
+    async def create_transcript(self, item_id, previous_item_id):
+        # TODO using whisper to get transcript
+        await asyncio.sleep(1)
+        transcript = 'Hi'
+        self.create_conversation_item(item={
+            'id': item_id,
+            'type': 'message',
+            'role': 'user',
+            'content': [{
+                'type': 'input_audio',
+                'transcript': None,
+            }]
+        }, previous_item_id=previous_item_id)
+        # 在openai的示例里面这个事件是在后面触发的
+        self.update_conversation_item(item_id, content=[{
+            'type': 'input_audio',
+            'transcript': transcript
+        }])
+        self.server_event(
+            'conversation.item.input_audio_transcription.completed',
+            item_id=item_id,
+            transcript=transcript,
+            content_index=0,
+        )
+        self.cancel_task()
+        self.response_task = asyncio.create_task(self.create_response())
 
     def cancel_task(self, send_event=True):
+        if self.transcript_task:
+            self.transcript_task.cancel()  # 取消旧的任务
+            self.transcript_task = None
         if self.response_task:
-            item_id = self.conversation[-1].get('id')
             self.response_task.cancel()  # 取消旧的任务
+            self.response_task = None
+            item_id = self.conversation[-1].get('id')
             logging.warn("cancel_task %r", item_id)
             if send_event:
                 self.server_event(
@@ -105,6 +200,11 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
         item.update(status=status, object='realtime.item')
         self.conversation.append(item)
         self.server_event('conversation.item.created', item=item, previous_item_id=previous_item_id)
+
+    def update_conversation_item(self, item_id, content=None):
+        for item in self.conversation:
+            if item_id == item['id']:
+                item['content'] = content
 
     async def create_response(self, type='text'):
         """
@@ -166,6 +266,10 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
             )
 
         text = ''.join(content)
+        self.update_conversation_item(item_id, content=[{
+            'type': type,
+            'transcript': text, 'text': text,
+        }])
         self.server_event(
             'response.audio_transcript.done' if type == 'audio' else 'response.text.done',
             transcript=text, text=text,
@@ -224,17 +328,21 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                 'audio_tokens': 0
             },
         })
+        self.response_task = None
 
     async def llm(self):
+        import litellm
+        litellm.set_verbose = True
         model = self.session.get('model')
         if model == 'gpt-4o-realtime-preview-2024-10-01':
             model = 'gpt-4o-mini'  # TODO
         messages = [{
             'role': item['role'],
-            'content': item['content'][0].get('text') or item['content'][0].get('input_text'),
+            'content': item['content'][0].get('text') or item['content'][0].get('input_text') or item['content'][0].get('transcript') ,
         } for item in self.conversation if len(item['content']) > 0]
         response = completion(model=model, messages=messages, stream=True)
         for part in response:
+            logging.info("part %r", part)
             yield part.choices[0].delta.content or ""
 
     def server_event(self, event_type, **kwargs):
