@@ -131,7 +131,7 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                 self.server_event('input_audio_buffer.speech_started', audio_start_ms=audio_start_ms, item_id=self.new_user_message_id)
             self.segments_result = segments_result
         else:
-            audio_end_ms = self.segments_result[-1][1]
+            audio_start_ms, audio_end_ms = self.segments_result[-1]
             if audio_end_ms and audio_end_ms != self.audio_end_ms:
                 self.audio_end_ms = audio_end_ms
                 silence_duration_ms = self.session.get('turn_detection', {}).get('silence_duration_ms', 500)
@@ -152,9 +152,14 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                         previous_item_id=previous_item_id,
                     )
                     self.cancel_task()
-                    self.transcript_task = asyncio.create_task(self.create_transcript(item_id, previous_item_id))
+                    self.transcript_task = asyncio.create_task(self.create_transcript(
+                        item_id,
+                        previous_item_id,
+                        audio_start_ms,
+                        audio_end_ms,
+                    ))
 
-    async def create_transcript(self, item_id, previous_item_id):
+    async def create_transcript(self, item_id, previous_item_id, audio_start_ms, audio_end_ms):
         # TODO using whisper to get transcript
         await asyncio.sleep(1)
         transcript = 'Hi'
@@ -359,8 +364,6 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
 
 def main():
     tornado.log.enable_pretty_logging()
-    # Create a web app whose only endpoint is a WebSocket, and start the web
-    # app on port 8888.
     app = tornado.web.Application(
         [(r"/realtime", RealtimeHandler)],
         websocket_ping_interval=10,
