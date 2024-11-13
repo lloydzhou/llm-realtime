@@ -85,6 +85,7 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
         self.response_task = None
         self.transcript_task = None
         self.input_audio_buffer = numpy.array([])
+        self.current_user_message_id = None
         self.new_user_message_id = None
         self.audio_end_ms = 0
         self.segments_result = [[-1, 0]]
@@ -142,6 +143,7 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
             audio_start_ms = segments_result[-1][0]
             if audio_start_ms != self.segments_result[-1][0]:
                 self.new_user_message_id = nanoid()
+                self.current_user_message_id = self.new_user_message_id
                 self.server_event('input_audio_buffer.speech_started', audio_start_ms=audio_start_ms, item_id=self.new_user_message_id)
             self.segments_result = segments_result
         else:
@@ -177,13 +179,24 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
     async def create_transcript(self, item_id, previous_item_id, audio_start_ms, audio_end_ms):
         # TODO using whisper to get transcript
         try:
+            self.create_conversation_item(item={
+                'id': item_id,
+                'type': 'message',
+                'role': 'user',
+                'content': [{
+                    'type': 'input_audio',
+                    'transcript': None,
+                }]
+            }, previous_item_id=previous_item_id)
+            transcript = ''
+
             sample_rate = int(self.vad_online.frontend.opts.frame_opts.samp_freq)
             start_index = int(audio_start_ms * sample_rate / 1000)
             end_index = int(audio_end_ms * sample_rate / 1000)
             audio_data = numpy.array(self.input_audio_buffer[start_index:end_index] * (1 << 15), dtype=numpy.int16)
 
             if audio_data.size < sample_rate:  # extend with empty audio data
-                audio_data.resize(sample_rate)
+                audio_data.resize(int(sample_rate * 1.2))
             byte_length = audio_data.size * 2
 
             audio_header = struct.pack(
@@ -208,19 +221,15 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                 model="whisper",
                 file=('input_audio.wav', audio_file)
             )
-            transcript = transcript.text
-            if transcript.strip() == '[BLANK_AUDIO]':  # empty audio data
+            logging.info("transcript %r", transcript)
+            transcript = transcript.text.strip()
+            # if not transcript or transcript == '[BLANK_AUDIO]':  # empty audio data
+            if not transcript:  # empty audio data
                 return
-            # transcript = 'Hi'
-            self.create_conversation_item(item={
-                'id': item_id,
-                'type': 'message',
-                'role': 'user',
-                'content': [{
-                    'type': 'input_audio',
-                    'transcript': None,
-                }]
-            }, previous_item_id=previous_item_id)
+        except asyncio.CancelledError as e:
+            print('cancel')
+            raise e
+        finally:
             # 在openai的示例里面这个事件是在后面触发的
             self.update_conversation_item(item_id, content=[{
                 'type': 'input_audio',
@@ -234,8 +243,7 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
             )
             self.cancel_task()
             self.response_task = asyncio.create_task(self.create_response())
-        finally:
-            self.cancel_transcript_task()
+            self.transcript_task = None
 
     def cancel_transcript_task(self):
         if self.transcript_task:
@@ -243,6 +251,12 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
             # print('transcript_task result', result)
             self.transcript_task.cancel()  # 取消旧的任务
             self.transcript_task = None
+            self.server_event(
+                'conversation.item.input_audio_transcription.failed',
+                item_id=self.current_user_message_id,
+                transcript='',
+                content_index=0,
+            )
 
     def cancel_task(self, send_event=True):
         if self.response_task:
@@ -283,7 +297,9 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
         6. response.done
         """
         try:
+            text = ''
             response_id = nanoid()
+            item_id = nanoid()
             self.server_event('response.created', response={
                 'id': response_id,
                 'object': 'realtime.response',
@@ -292,7 +308,6 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                 'output': [],
                 'usage': None,
             })
-            item_id = nanoid()
             self.server_event('response.output_item.added', item={
                 'id': item_id,
                 'object': 'realtime.item',
@@ -329,6 +344,10 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                 )
 
             text = ''.join(content)
+        except asyncio.CancelledError as e:
+            print('cancel')
+            raise e
+        finally:
             self.update_conversation_item(item_id, content=[{
                 'type': type,
                 'transcript': text, 'text': text,
@@ -391,7 +410,6 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                     'audio_tokens': 0
                 },
             })
-        finally:
             self.cancel_task(False)
 
     async def llm(self):
@@ -400,7 +418,7 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
             model = 'gpt-4o-mini'  # TODO
         messages = [{
             'role': item['role'],
-            'content': item['content'][0].get('text') or item['content'][0].get('input_text') or item['content'][0].get('transcript') ,
+            'content': item['content'][0].get('text') or item['content'][0].get('input_text') or item['content'][0].get('transcript') or '',
         } for item in self.conversation if len(item['content']) > 0]
         response = completion(model=model, messages=messages, stream=True)
         for part in response:
