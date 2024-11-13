@@ -27,6 +27,7 @@ import json
 import numpy
 import fsmnvad
 import asyncio
+import struct
 import logging
 import tornado.log
 import tornado.ioloop
@@ -34,8 +35,22 @@ import tornado.web
 import tornado.websocket
 from functools import partial
 from nanoid import generate as nanoid
-from litellm import completion
+from litellm import completion, transcription, Router
 from pathlib import Path
+
+
+# using local whisper server, whisper.cpp
+# ./server -m ~/.local/share/pywhispercpp/models/ggml-base.bin --inference-path /v1/audio/transcriptions
+whisper_client = Router(model_list = [
+    {
+        "model_name": "whisper",
+        "litellm_params": {
+            "model": "whisper-1",
+            "api_key": "placeholder",
+            "api_base": "http://127.0.0.1:8080/v1",
+        },
+    },
+])
 
 
 root_dir = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -44,7 +59,7 @@ root_dir = Path(os.path.dirname(os.path.abspath(__file__)))
 class RealtimeHandler(tornado.websocket.WebSocketHandler):
 
     def initialize(self):
-        logging.info("initialize %r %r %r", self, self.request, self.request.headers)
+        # logging.info("initialize %r %r %r", self, self.request, self.request.headers)
         self.session = dict(
             id=nanoid(),
             object='realtime.session',
@@ -93,12 +108,11 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
         self.server_event('session.created', session=self.session)
 
     def on_message(self, message):
-        logging.info("on_message %r", message[:100])
+        # logging.info("on_message %r", message[:100])
         try:
             event = json.loads(message)
             self.client_event(**event)
         except Exception as e:
-            logging.exception(e)
             logging.error(e)
 
     def client_event(self, id='', type='', **kwargs):
@@ -151,6 +165,7 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                         item_id=item_id,
                         previous_item_id=previous_item_id,
                     )
+                    self.cancel_transcript_task()
                     self.cancel_task()
                     self.transcript_task = asyncio.create_task(self.create_transcript(
                         item_id,
@@ -161,36 +176,78 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
 
     async def create_transcript(self, item_id, previous_item_id, audio_start_ms, audio_end_ms):
         # TODO using whisper to get transcript
-        await asyncio.sleep(1)
-        transcript = 'Hi'
-        self.create_conversation_item(item={
-            'id': item_id,
-            'type': 'message',
-            'role': 'user',
-            'content': [{
-                'type': 'input_audio',
-                'transcript': None,
-            }]
-        }, previous_item_id=previous_item_id)
-        # 在openai的示例里面这个事件是在后面触发的
-        self.update_conversation_item(item_id, content=[{
-            'type': 'input_audio',
-            'transcript': transcript
-        }])
-        self.server_event(
-            'conversation.item.input_audio_transcription.completed',
-            item_id=item_id,
-            transcript=transcript,
-            content_index=0,
-        )
-        self.cancel_task()
-        self.response_task = asyncio.create_task(self.create_response())
+        try:
+            sample_rate = int(self.vad_online.frontend.opts.frame_opts.samp_freq)
+            start_index = int(audio_start_ms * sample_rate / 1000)
+            end_index = int(audio_end_ms * sample_rate / 1000)
+            audio_data = numpy.array(self.input_audio_buffer[start_index:end_index] * (1 << 15), dtype=numpy.int16)
 
-    def cancel_task(self, send_event=True):
+            if audio_data.size < sample_rate:  # extend with empty audio data
+                audio_data.resize(sample_rate)
+            byte_length = audio_data.size * 2
+
+            audio_header = struct.pack(
+                "<4sL4s4sLHHLLHH4sL",
+                b"RIFF",  # RIFF identifier 'RIFF'
+                36 + byte_length,  # file length minus RIFF identifier length and file description length
+                b"WAVE",  # RIFF type 'WAVE'
+                b"fmt ",  # format chunk identifier 'fmt '
+                16,  # format chunk length
+                1,  # sample format (raw)
+                1,  # channel count
+                sample_rate,
+                int(sample_rate * 4),  # byte rate (sample rate * block align)
+                2,  # block align (channel count * bytes per sample)
+                16,  # bits per sample
+                b"data",  # data chunk identifier 'data'
+                byte_length,
+            )
+            audio_file = audio_header + audio_data.tobytes()
+
+            transcript = await whisper_client.atranscription(
+                model="whisper",
+                file=('input_audio.wav', audio_file)
+            )
+            transcript = transcript.text
+            if transcript.strip() == '[BLANK_AUDIO]':  # empty audio data
+                return
+            # transcript = 'Hi'
+            self.create_conversation_item(item={
+                'id': item_id,
+                'type': 'message',
+                'role': 'user',
+                'content': [{
+                    'type': 'input_audio',
+                    'transcript': None,
+                }]
+            }, previous_item_id=previous_item_id)
+            # 在openai的示例里面这个事件是在后面触发的
+            self.update_conversation_item(item_id, content=[{
+                'type': 'input_audio',
+                'transcript': transcript
+            }])
+            self.server_event(
+                'conversation.item.input_audio_transcription.completed',
+                item_id=item_id,
+                transcript=transcript,
+                content_index=0,
+            )
+            self.cancel_task()
+            self.response_task = asyncio.create_task(self.create_response())
+        finally:
+            self.cancel_transcript_task()
+
+    def cancel_transcript_task(self):
         if self.transcript_task:
+            # result = self.transcript_task.result()
+            # print('transcript_task result', result)
             self.transcript_task.cancel()  # 取消旧的任务
             self.transcript_task = None
+
+    def cancel_task(self, send_event=True):
         if self.response_task:
+            # result = self.response_task.result()
+            # print('response_task result', result)
             self.response_task.cancel()  # 取消旧的任务
             self.response_task = None
             item_id = self.conversation[-1].get('id')
@@ -225,119 +282,119 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
         7. response.output_item.done
         6. response.done
         """
-        response_id = nanoid()
-        self.server_event('response.created', response={
-            'id': response_id,
-            'object': 'realtime.response',
-            'status': 'in_progress',
-            'status_details': None,
-            'output': [],
-            'usage': None,
-        })
-        item_id = nanoid()
-        self.server_event('response.output_item.added', item={
-            'id': item_id,
-            'object': 'realtime.item',
-            'type': 'message',
-            'status': 'in_progress',
-            'role': 'assistant',
-            'content': [],
-        }, response_id=response_id, output_index=0)
+        try:
+            response_id = nanoid()
+            self.server_event('response.created', response={
+                'id': response_id,
+                'object': 'realtime.response',
+                'status': 'in_progress',
+                'status_details': None,
+                'output': [],
+                'usage': None,
+            })
+            item_id = nanoid()
+            self.server_event('response.output_item.added', item={
+                'id': item_id,
+                'object': 'realtime.item',
+                'type': 'message',
+                'status': 'in_progress',
+                'role': 'assistant',
+                'content': [],
+            }, response_id=response_id, output_index=0)
 
-        previous_item_id = self.conversation[-1].get('id')
-        self.create_conversation_item(item={
-            'id': item_id,
-            'type': 'message',
-            'role': 'assistant',
-            'content': []
-        }, status='in_progress', previous_item_id=previous_item_id)
+            previous_item_id = self.conversation[-1].get('id')
+            self.create_conversation_item(item={
+                'id': item_id,
+                'type': 'message',
+                'role': 'assistant',
+                'content': []
+            }, status='in_progress', previous_item_id=previous_item_id)
 
-        self.server_event('response.content_part.added', part={
-            'type': type,
-            'transcript': '', 'text': '',
-        }, response_id=response_id, item_id=item_id, output_index=0, content_index=0)
-        # get delta from llm
-        content = []
-        async for delta in self.llm():
-            # mock get response
-            content.append(delta)
+            self.server_event('response.content_part.added', part={
+                'type': type,
+                'transcript': '', 'text': '',
+            }, response_id=response_id, item_id=item_id, output_index=0, content_index=0)
+            # get delta from llm
+            content = []
+            async for delta in self.llm():
+                # mock get response
+                content.append(delta)
+                self.server_event(
+                    'response.audio_transcript.delta' if type == 'audio' else 'response.text.delta',
+                    delta=delta,
+                    response_id=response_id,
+                    item_id=item_id,
+                    output_index=0,
+                    content_index=0
+                )
+
+            text = ''.join(content)
+            self.update_conversation_item(item_id, content=[{
+                'type': type,
+                'transcript': text, 'text': text,
+            }])
             self.server_event(
-                'response.audio_transcript.delta' if type == 'audio' else 'response.text.delta',
-                delta=delta,
+                'response.audio_transcript.done' if type == 'audio' else 'response.text.done',
+                transcript=text, text=text,
                 response_id=response_id,
                 item_id=item_id,
                 output_index=0,
-                content_index=0
+                content_index=0,
             )
-
-        text = ''.join(content)
-        self.update_conversation_item(item_id, content=[{
-            'type': type,
-            'transcript': text, 'text': text,
-        }])
-        self.server_event(
-            'response.audio_transcript.done' if type == 'audio' else 'response.text.done',
-            transcript=text, text=text,
-            response_id=response_id,
-            item_id=item_id,
-            output_index=0,
-            content_index=0,
-        )
-        self.server_event('response.content_part.done', part={
-            'type': type,
-            'transcript': text, 'text': text,
-        }, response_id=response_id, item_id=item_id, output_index=0, content_index=0)
-        self.server_event('response.output_item.done', item={
-            'id': item_id,
-            'object': 'realtime.item',
-            'type': 'message',
-            'status': 'completed',
-            'role': 'assistant',
-            'content': [{
+            self.server_event('response.content_part.done', part={
                 'type': type,
                 'transcript': text, 'text': text,
-            }],
-        }, response_id=response_id, output_index=0)
-        self.server_event('response.done', response={
-            'id': response_id,
-            'object': 'realtime.response',
-            'status': 'completed',
-            'status_details': None,
-            'output': [{
-                'type': item_id,
+            }, response_id=response_id, item_id=item_id, output_index=0, content_index=0)
+            self.server_event('response.output_item.done', item={
+                'id': item_id,
                 'object': 'realtime.item',
                 'type': 'message',
                 'status': 'completed',
                 'role': 'assistant',
                 'content': [{
                     'type': type,
-                    'transcript': text,
-                    'text': text,
-                }]
-            }],
-        }, usage={
-            'total_tokens': 0,
-            'input_tokens': 0,
-            'output_tokens': 0,
-            'input_token_details': {
-                'cached_tokens': 0,
-                'text_tokens': 0,
-                'audio_tokens': 0,
-                'cached_tokens_details': {
+                    'transcript': text, 'text': text,
+                }],
+            }, response_id=response_id, output_index=0)
+            self.server_event('response.done', response={
+                'id': response_id,
+                'object': 'realtime.response',
+                'status': 'completed',
+                'status_details': None,
+                'output': [{
+                    'type': item_id,
+                    'object': 'realtime.item',
+                    'type': 'message',
+                    'status': 'completed',
+                    'role': 'assistant',
+                    'content': [{
+                        'type': type,
+                        'transcript': text,
+                        'text': text,
+                    }]
+                }],
+            }, usage={
+                'total_tokens': 0,
+                'input_tokens': 0,
+                'output_tokens': 0,
+                'input_token_details': {
+                    'cached_tokens': 0,
+                    'text_tokens': 0,
+                    'audio_tokens': 0,
+                    'cached_tokens_details': {
+                        'text_tokens': 0,
+                        'audio_tokens': 0
+                    }
+                },
+                'output_token_details': {
                     'text_tokens': 0,
                     'audio_tokens': 0
-                }
-            },
-            'output_token_details': {
-                'text_tokens': 0,
-                'audio_tokens': 0
-            },
-        })
-        self.response_task = None
+                },
+            })
+        finally:
+            self.cancel_task(False)
 
     async def llm(self):
-        import litellm
-        litellm.set_verbose = True
         model = self.session.get('model')
         if model == 'gpt-4o-realtime-preview-2024-10-01':
             model = 'gpt-4o-mini'  # TODO

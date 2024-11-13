@@ -1,7 +1,7 @@
 WavFrontend:
   cmvn_file: runtime/onnx/vad/onnx/am.mvn
   frontend_conf:
-    fs: 24000
+    fs: 16000
     window: hamming
     n_mels: 80
     frame_length: 25
@@ -33,7 +33,7 @@ FSMN:
         output_dim: 248
         
 vadPostArgs:
-  sample_rate: 24000
+  sample_rate: 16000
   detect_mode: 1
   snr_mode: 0
   max_end_silence_time: 800
