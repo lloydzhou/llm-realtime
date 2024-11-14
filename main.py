@@ -40,14 +40,25 @@ from pathlib import Path
 
 
 # using local whisper server, whisper.cpp
-# ./server -m ~/.local/share/pywhispercpp/models/ggml-base.bin --inference-path /v1/audio/transcriptions
-whisper_client = Router(model_list = [
+client = Router(model_list = [
+    # docker run --publish 8000:8000 --volume ~/.cache/huggingface:/root/.cache/huggingface fedirz/faster-whisper-server:latest-cpu
     {
-        "model_name": "whisper",
+        "model_name": "whisper-1",
         "litellm_params": {
-            "model": "whisper-1",
+            "model": "openai/Systran/faster-whisper-base",
             "api_key": "placeholder",
-            "api_base": "http://127.0.0.1:8080/v1",
+            "api_base": "http://127.0.0.1:8000/v1",
+        },
+    },
+    {
+        "model_name": "tts-1",
+        "litellm_params": {
+            # "model": "openai/piper",
+            "model": "openai/tts-1",
+            # "voice": "en_US-amy-medium",
+            "response_format": "pcm",
+            # "api_key": "placeholder",
+            # "api_base": "http://127.0.0.1:8000/v1",
         },
     },
 ])
@@ -69,7 +80,9 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
             voice='alloy',
             input_audio_format='pcm16',
             output_audio_format='pcm16',
-            input_audio_transcription={'model': 'whisper-1'},
+            input_audio_transcription={
+                'model': 'whisper-1',  # model = client[0].model_name
+            },
             turn_detection=dict(
                 type='server_vad',
                 threshold=0.5,
@@ -146,7 +159,8 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                 self.current_user_message_id = self.new_user_message_id
                 self.server_event('input_audio_buffer.speech_started', audio_start_ms=audio_start_ms, item_id=self.new_user_message_id)
             self.segments_result = segments_result
-        else:
+        # else:
+        elif not self.transcript_task and not self.response_task:  # 暂时不支持打断
             audio_start_ms, audio_end_ms = self.segments_result[-1]
             if audio_end_ms and audio_end_ms != self.audio_end_ms:
                 self.audio_end_ms = audio_end_ms
@@ -217,8 +231,9 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
             )
             audio_file = audio_header + audio_data.tobytes()
 
-            transcript = await whisper_client.atranscription(
-                model="whisper",
+            model = self.session.get('input_audio_transcription', {}).get('model', 'whisper-1')
+            transcript = await client.atranscription(
+                model=model,
                 file=('input_audio.wav', audio_file)
             )
             logging.info("transcript %r", transcript)
@@ -242,7 +257,7 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                 content_index=0,
             )
             self.cancel_task()
-            self.response_task = asyncio.create_task(self.create_response())
+            self.response_task = asyncio.create_task(self.create_response(type='audio'))
             self.transcript_task = None
 
     def cancel_transcript_task(self):
@@ -352,6 +367,29 @@ class RealtimeHandler(tornado.websocket.WebSocketHandler):
                 'type': type,
                 'transcript': text, 'text': text,
             }])
+            if type == "audio":
+                logging.info("speech %r", text)
+                audio = await client.aspeech(
+                    model="openai/tts-1",
+                    input=text,
+                    voice=self.session.get("voice", "alloy"),
+                )
+                logging.info("speech %r %r", audio, len(audio.content))
+                self.server_event(
+                    'response.audio.delta',
+                    response_id=response_id,
+                    item_id=item_id,
+                    output_index=0,
+                    content_index=0,
+                    delta=base64.b64encode(audio.content).decode(),
+                )
+                self.server_event(
+                    'response.audio.done',
+                    response_id=response_id,
+                    item_id=item_id,
+                    output_index=0,
+                    content_index=0,
+                )
             self.server_event(
                 'response.audio_transcript.done' if type == 'audio' else 'response.text.done',
                 transcript=text, text=text,
